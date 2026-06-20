@@ -1,0 +1,39 @@
+# ==========================================
+#  .gitignore — HR-SpO2 Monitor Project
+# ==========================================
+
+# Tài liệu cá nhân / báo cáo (không push lên repo)
+*.docx
+*.pdf
+*.doc
+
+# Thư mục docx (tài liệu Word)
+docx/
+
+# Agent config
+.agent/
+.agent
+
+# Node.js dependencies
+node_modules/
+
+# Edge Impulse ZIP files và extracted folders (lớn, không cần push)
+*.zip
+ei-max30102-arduino-*/
+ei-max30102-arduino-1.0.1-impulse-\#1/
+ei-max30102-arduino-1.0.2-impulse-\#1/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE / Editor
+.vscode/
+*.suo
+*.user

@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Giám Sát Nhịp Tim & SpO2</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+      min-height: 100vh;
+      color: #fff;
+      padding: 24px 16px;
+    }
+
+    h1 {
+      text-align: center;
+      font-size: 1.35em;
+      letter-spacing: 1px;
+      margin-bottom: 24px;
+      text-shadow: 0 0 30px #7c5cbf;
+    }
+
+    /* ─── Cards HR / SpO2 ─── */
+    .cards {
+      display: flex;
+      gap: 14px;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin-bottom: 18px;
+    }
+
+    .card {
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.14);
+      border-radius: 18px;
+      padding: 22px 32px;
+      min-width: 148px;
+      text-align: center;
+      backdrop-filter: blur(12px);
+      transition: transform 0.25s, box-shadow 0.25s;
+    }
+
+    .card:hover {
+      transform: translateY(-5px);
+      box-shadow: 0 12px 32px rgba(0,0,0,0.35);
+    }
+
+    .card .lbl  { font-size: 0.72em; color: #aaa; margin-bottom: 8px; letter-spacing: 2px; text-transform: uppercase; }
+    .card .val  { font-size: 2.6em; font-weight: 700; line-height: 1; }
+    .card .unit { font-size: 0.75em; color: #bbb; margin-top: 4px; }
+
+    #hr-val   { color: #ff6b6b; }
+    #spo2-val { color: #74b9ff; }
+
+    /* ─── Status Box ─── */
+    .status-box {
+      text-align: center;
+      padding: 18px 24px;
+      border-radius: 18px;
+      font-size: 1.25em;
+      font-weight: 700;
+      margin-bottom: 18px;
+      border: 1px solid rgba(255,255,255,0.1);
+      backdrop-filter: blur(8px);
+      transition: background 0.6s, box-shadow 0.4s;
+      letter-spacing: 0.5px;
+    }
+
+    /* ─── Confidence bars ─── */
+    .conf-section {
+      margin-bottom: 18px;
+    }
+
+    .conf-section h3 {
+      font-size: 0.75em;
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      color: #999;
+      text-align: center;
+      margin-bottom: 10px;
+    }
+
+    .conf-row {
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .conf-item {
+      background: rgba(255,255,255,0.07);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 14px;
+      padding: 12px 20px;
+      min-width: 108px;
+      text-align: center;
+    }
+
+    .conf-item .cl  { font-size: 0.72em; color: #bbb; margin-bottom: 6px; }
+    .conf-item .pct { font-size: 1.5em; font-weight: 700; }
+
+    #pct-normal  { color: #2ecc71; }
+    #pct-warning { color: #f1c40f; }
+    #pct-danger  { color: #e74c3c; }
+
+    /* ─── Anomaly score ─── */
+    .anomaly-row {
+      text-align: center;
+      color: #888;
+      font-size: 0.82em;
+      margin-bottom: 20px;
+    }
+
+    #anomaly { color: #e67e22; font-weight: 600; }
+
+    /* ─── Footer ─── */
+    .footer {
+      text-align: center;
+      color: #555;
+      font-size: 0.74em;
+    }
+
+    .dot {
+      display: inline-block;
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #2ecc71;
+      margin-right: 6px;
+      animation: blink 1.4s infinite;
+    }
+
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+
+    /* ─── Responsive ─── */
+    @media (max-width: 400px) {
+      .card { min-width: 120px; padding: 16px 20px; }
+      .card .val { font-size: 2em; }
+    }
+  </style>
+</head>
+<body>
+
+  <h1>🫀 Giám Sát Nhịp Tim &amp; SpO2</h1>
+
+  <!-- HR / SpO2 -->
+  <div class="cards">
+    <div class="card">
+      <div class="lbl">Nhịp Tim</div>
+      <div class="val" id="hr-val">--</div>
+      <div class="unit">bpm</div>
+    </div>
+    <div class="card">
+      <div class="lbl">Oxy Máu</div>
+      <div class="val" id="spo2-val">--</div>
+      <div class="unit">% SpO2</div>
+    </div>
+  </div>
+
+  <!-- Trạng thái AI -->
+  <div class="status-box" id="status-box">⏳ Đang chờ dữ liệu...</div>
+
+  <!-- Confidence -->
+  <div class="conf-section">
+    <h3>Phân loại Edge AI</h3>
+    <div class="conf-row">
+      <div class="conf-item">
+        <div class="cl">🟢 Normal</div>
+        <div class="pct" id="pct-normal">--%</div>
+      </div>
+      <div class="conf-item">
+        <div class="cl">🟡 Warning</div>
+        <div class="pct" id="pct-warning">--%</div>
+      </div>
+      <div class="conf-item">
+        <div class="cl">🔴 Danger</div>
+        <div class="pct" id="pct-danger">--%</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Anomaly -->
+  <div class="anomaly-row">
+    Anomaly score (K-means): <span id="anomaly">--</span>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <span class="dot"></span>Cập nhật mỗi 3 giây &nbsp;|&nbsp; ESP32-S3 N16R8
+  </div>
+
+  <script>
+    function getColor(status) {
+      if (status.includes('NGUY'))  return 'rgba(231,76,60,0.35)';
+      if (status.includes('CẢNH')) return 'rgba(241,196,15,0.30)';
+      if (status.includes('BÌNH')) return 'rgba(46,204,113,0.28)';
+      return 'rgba(100,100,100,0.25)';
+    }
+
+    function fetchData() {
+      fetch('/data')
+        .then(r => r.json())
+        .then(d => {
+          // HR & SpO2
+          document.getElementById('hr-val').textContent
+            = d.hr   > 0 ? Math.round(d.hr)        : '--';
+          document.getElementById('spo2-val').textContent
+            = d.spo2 > 0 ? d.spo2.toFixed(1)       : '--';
+
+          // Status
+          const box = document.getElementById('status-box');
+          box.textContent      = d.status;
+          box.style.background = getColor(d.status);
+
+          // Confidence
+          document.getElementById('pct-normal').textContent
+            = (d.normal  * 100).toFixed(1) + '%';
+          document.getElementById('pct-warning').textContent
+            = (d.warning * 100).toFixed(1) + '%';
+          document.getElementById('pct-danger').textContent
+            = (d.danger  * 100).toFixed(1) + '%';
+
+          // Anomaly
+          document.getElementById('anomaly').textContent
+            = d.anomaly.toFixed(4);
+        })
+        .catch(() => {
+          document.getElementById('status-box').textContent = '🔌 Mất kết nối...';
+        });
+    }
+
+    fetchData();
+    setInterval(fetchData, 3000);
+  </script>
+</body>
+</html>

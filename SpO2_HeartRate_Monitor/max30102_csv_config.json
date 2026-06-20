@@ -1,0 +1,17 @@
+{
+    "version": 1,
+    "fileName": "dataset_max30102.csv",
+    "created": 1781336939149,
+    "delimiter": ",",
+    "skipFirstLines": 0,
+    "spec": {
+        "type": "features",
+        "labelColumns": [
+            "label"
+        ],
+        "valueColumns": [
+            "heart_rate",
+            "spo2"
+        ]
+    }
+}
