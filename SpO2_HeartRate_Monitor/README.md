@@ -180,6 +180,14 @@ git clone https://github.com/phicao512-spec/HR-Spo2.git
 
 ## Changelog
 
+### 2026-06-21
+- **[ALGO]** Thay thuật toán SpO2/HR bằng **EMA BPF sample-by-sample** (port từ [manhzzzz/stm32f-max30102-rtos](https://github.com/manhzzzz/stm32f-max30102-rtos/blob/main/Core/Src/main.c))
+  - Xóa: `heartRate.h`, `spo2_algorithm.h`, `collectAndComputeSpO2()`, buffer 100 mẫu
+  - Thêm: `max30102_cal()` — xử lý từng mẫu, kết quả ngay sau **~2-3 giây** (thay vì 10 giây)
+  - Thêm: `#include <math.h>` (fabsf, fmaxf)
+  - AI inference trigger: mỗi **5 giây** (thay vì sau mỗi lần batch collect)
+- **[CLONE]** Clone repo `manhzzzz/stm32f-max30102-rtos` làm tài liệu tham khảo thuật toán
+
 ### 2026-06-20
 - **[PORT]** Port driver MAX30102 từ STM32 HAL C sang Arduino/ESP32 (Wire.h)
   - Thay thế `MAX30105.h` (SparkFun sensor layer) bằng custom HAL-style driver inline

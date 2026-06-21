@@ -149,8 +149,25 @@ uint8_t max30102_read_fifo_bulk(max30102_t *obj, uint32_t *ir_buf, uint32_t *red
     return (uint8_t)num;
 }
 // ═══════════════════════════════════════════════════════════════
-#include "heartRate.h"          // SparkFun beat detection
-#include "spo2_algorithm.h"     // SparkFun SpO2
+#include <math.h>               // fabsf, fmaxf (EMA BPF algorithm)
+
+// ═══════════════════════════════════════════════════════════════
+//  THONG SO THUAT TOAN EMA BPF
+//  Port tu: manhzzzz/stm32f-max30102-rtos/Core/Src/main.c
+//  FS_HZ dieu chinh 50->100 de khop SR=100Hz cau hinh sensor
+// ═══════════════════════════════════════════════════════════════
+#define FS_HZ           100.0f   // Toc do mau thuat toan (khop SR=100Hz)
+#define ALPHA_DC        0.01f    // EMA DC (~1s)
+#define ALPHA_FAST      0.25f    // EMA nhanh (~5Hz)
+#define ALPHA_SLOW      0.02f    // EMA cham (~0.5Hz)
+#define ALPHA_ENV       0.10f    // EMA envelope |AC|
+#define ALPHA_HR_EMA    0.20f    // Lam muot HR
+#define ALPHA_SPO2_EMA  0.15f    // Lam muot SpO2
+#define REFRACTORY_SEC  0.35f    // 350ms chong dem trung
+#define MIN_THR_ABS     8.0f     // Nguong phat hien peak toi thieu
+#define THR_K_ENV       0.5f     // Nguong thich nghi = K * envelope
+#define HR_AVG_BEATS    6        // So chu ky lay trung binh HR
+// ═══════════════════════════════════════════════════════════════
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
@@ -164,8 +181,8 @@ uint8_t max30102_read_fifo_bulk(max30102_t *obj, uint32_t *ir_buf, uint32_t *red
 // ═══════════════════════════════════════════════════════════════
 //  CAU HINH
 // ═══════════════════════════════════════════════════════════════
-#define WIFI_SSID      "TEN_WIFI"
-#define WIFI_PASSWORD  "MAT_KHAU"
+#define WIFI_SSID      "H09"
+#define WIFI_PASSWORD  "hoilamgi"
 
 #define I2C_SDA   8
 #define I2C_SCL   9
@@ -183,29 +200,16 @@ max30102_t        particleSensor;
 Adafruit_SSD1306  display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 WebServer         server(80);
 
-// Heart Rate — SparkFun checkForBeat
-const byte RATE_SIZE = 8;
-byte  rates[RATE_SIZE];
-byte  rateSpot  = 0;
-long  lastBeat  = 0;
-float beatsPerMinute = 0;
-int   beatAvg   = 0;
-
-// SpO2 — buffer-based
-#define SPO2_BUFFER_LEN 100
-uint32_t irBuffer[SPO2_BUFFER_LEN];
-uint32_t redBuffer[SPO2_BUFFER_LEN];
-int32_t  spo2_value     = 0;
-int8_t   spo2_valid     = 0;
-int32_t  hr_spo2_value  = 0;
-int8_t   hr_spo2_valid  = 0;
-unsigned long lastSpo2Time = 0;
-#define SPO2_INTERVAL_MS 10000  // tinh SpO2 moi 10 giay
+// Heart Rate & SpO2 — EMA BPF (sample-by-sample, khong can buffer)
+int   beatAvg   = 0;   // HR hien thi (bpm), cap nhat lien tuc
 
 // Shared state
 float  g_heart_rate    = 0.0f;
 float  g_spo2          = 0.0f;
 bool   g_finger_on     = false;
+
+float  g_plot_sig      = 0.0f;
+float  g_plot_env      = 1.0f;
 
 String g_status        = "KHOI DONG";
 float  g_anomaly_score = 0.0f;
@@ -259,77 +263,170 @@ void runInference(float hr, float spo2) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  SpO2 — thu thap buffer va tinh
+//  THUAT TOAN EMA BPF — tinh HR va SpO2 theo tung mau
+//  Port tu: manhzzzz/stm32f-max30102-rtos/Core/Src/main.c
+//  Uu diem: ket qua ngay sau ~2-3s, tu thich nghi bien do tin hieu
 // ═══════════════════════════════════════════════════════════════
-void collectAndComputeSpO2() {
-    Serial.println("[SpO2] Thu thap 100 mau...");
+void max30102_cal(uint32_t red_raw, uint32_t ir_raw) {
+    // Khong co ngon tay — reset ket qua
+    if (ir_raw < 50000) { g_heart_rate = 0.0f; g_spo2 = 0.0f; beatAvg = 0; return; }
 
-    // Thu thap SPO2_BUFFER_LEN mau bang cach poll FIFO truc tiep
-    // Timeout: toi da 15 giay de tranh treo vo han
-    int collected = 0;
-    unsigned long t0 = millis();
-    while (collected < SPO2_BUFFER_LEN) {
-        if (millis() - t0 > 15000) {
-            Serial.printf("[SpO2] TIMEOUT! Chi thu thap duoc %d/%d mau\n", collected, SPO2_BUFFER_LEN);
-            break;
+    static float ir_dc=0,   red_dc=0;
+    static float ir_fast=0, ir_slow=0,  red_fast=0, red_slow=0;
+    static float ir_bpf=0,  red_bpf=0;
+    static float ir_env=1,  red_env=1;
+    static float prev2=0,   prev1=0;
+    static uint16_t ref_count = 0;
+    static uint16_t ibi_buf[HR_AVG_BEATS] = {0};
+    static uint8_t  ibi_len = 0;
+    static uint16_t samples_since_peak = 0;
+    static float hr_ema   = 0.0f;
+    static float spo2_ema = 0.0f;
+
+    // --- Loc DC (EMA low-pass) ---
+    ir_dc  += ALPHA_DC * ((float)ir_raw  - ir_dc);
+    red_dc += ALPHA_DC * ((float)red_raw - red_dc);
+
+    // --- Band-pass filter: BPF = EMA_fast - EMA_slow ---
+    ir_fast  += ALPHA_FAST * ((float)ir_raw  - ir_fast);
+    ir_slow  += ALPHA_SLOW * ((float)ir_raw  - ir_slow);
+    ir_bpf    = ir_fast - ir_slow;
+
+    red_fast += ALPHA_FAST * ((float)red_raw - red_fast);
+    red_slow += ALPHA_SLOW * ((float)red_raw - red_slow);
+    red_bpf   = red_fast - red_slow;
+
+    // --- Envelope (bien do AC, dung cho nguong thich nghi) ---
+    ir_env  += ALPHA_ENV * (fabsf(ir_bpf)  - ir_env);
+    red_env += ALPHA_ENV * (fabsf(red_bpf) - red_env);
+
+    // --- Peak detection (phat hien dinh song nhip tim) ---
+    if (ref_count > 0) ref_count--;
+    samples_since_peak++;
+
+    float thr = fmaxf(MIN_THR_ABS, THR_K_ENV * ir_env);
+    if ((prev2 < prev1) && (prev1 > ir_bpf) && (prev1 >= thr) && (ref_count == 0)) {
+        ref_count = (uint16_t)(FS_HZ * REFRACTORY_SEC);  // chong dem trung
+        uint16_t ibi = samples_since_peak;               // khoang cach giua 2 dinh
+        samples_since_peak = 0;
+
+        // Cap nhat ring buffer IBI (inter-beat interval)
+        if (ibi_len < HR_AVG_BEATS) ibi_buf[ibi_len++] = ibi;
+        else {
+            for (int i = HR_AVG_BEATS-1; i > 0; --i) ibi_buf[i] = ibi_buf[i-1];
+            ibi_buf[0] = ibi;
         }
-        uint8_t got = max30102_read_fifo_bulk(
-            &particleSensor,
-            irBuffer  + collected,
-            redBuffer + collected,
-            (uint8_t)(SPO2_BUFFER_LEN - collected)
-        );
-        if (got > 0) collected += got;
-        else delay(10); // cho FIFO co du lieu
-    }
-    if (collected < SPO2_BUFFER_LEN) {
-        Serial.println("[SpO2] Khong du mau, bo qua lan nay.");
-        return;
-    }
 
-    // Tinh SpO2 va HR tu buffer
-    maxim_heart_rate_and_oxygen_saturation(
-        irBuffer, SPO2_BUFFER_LEN, redBuffer,
-        &spo2_value, &spo2_valid,
-        &hr_spo2_value, &hr_spo2_valid
-    );
-
-    if (spo2_valid && spo2_value > 0 && spo2_value <= 100) {
-        g_spo2 = (float)spo2_value;
+        // Tinh HR tu IBI trung binh (can >= 2 diem)
+        if (ibi_len >= 2) {
+            uint32_t sum = 0;
+            for (int i = 0; i < ibi_len; ++i) sum += ibi_buf[i];
+            float ibi_avg = (float)sum / (float)ibi_len;
+            float hr_inst = 60.0f * (FS_HZ / ibi_avg);
+            if (hr_ema <= 1.0f) hr_ema = hr_inst;
+            else hr_ema += ALPHA_HR_EMA * (hr_inst - hr_ema);
+            if (hr_ema < 30.0f)  hr_ema = 30.0f;
+            if (hr_ema > 220.0f) hr_ema = 220.0f;
+            beatAvg      = (int)(hr_ema + 0.5f);
+            g_heart_rate = hr_ema;
+        }
     }
+    prev2 = prev1; prev1 = ir_bpf;
 
-    Serial.printf("[SpO2] SpO2=%d (v=%d) HR=%d (v=%d)\n",
-        spo2_value, spo2_valid, hr_spo2_value, hr_spo2_valid);
+    // --- Tinh SpO2: R = (AC_red/DC_red) / (AC_ir/DC_ir), SpO2 = 110 - 25*R ---
+    float rdc = fmaxf(1.0f, red_dc),  idc = fmaxf(1.0f, ir_dc);
+    float rac  = fmaxf(1.0f, red_env), iac = fmaxf(1.0f, ir_env);
+    float R    = (rac / rdc) / (iac / idc);
+    float spo2_inst = 110.0f - 25.0f * R;
+
+    if (spo2_ema <= 1.0f) spo2_ema = spo2_inst;
+    else spo2_ema += ALPHA_SPO2_EMA * (spo2_inst - spo2_ema);
+    if (spo2_ema < 70.0f)  spo2_ema = 70.0f;
+    if (spo2_ema > 100.0f) spo2_ema = 100.0f;
+    g_spo2 = spo2_ema;
+
+    g_plot_sig = ir_bpf;
+    g_plot_env = ir_env;
 }
 
 // ═══════════════════════════════════════════════════════════════
 //  OLED
 // ═══════════════════════════════════════════════════════════════
+#define UI_HEADER_H   40
+#define WAVE_Y0       UI_HEADER_H
+#define WAVE_H        (64 - UI_HEADER_H)
+
+#define COL_W   42
+#define COL0_X  2
+#define COL1_X  (COL0_X + COL_W)
+#define COL2_X  (COL1_X + COL_W)
+#define WAVEFORM_WIDTH 128
+
+uint8_t waveform_buffer[WAVEFORM_WIDTH] = {0};
+uint8_t waveform_x = 0;
+
 void updateOLED() {
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
 
-    display.setTextSize(1); display.setCursor(0, 0);  display.print("HR:");
-    display.setTextSize(2); display.setCursor(22, 0);
-    if (g_finger_on && beatAvg > 0) display.printf("%3d bpm", beatAvg);
-    else display.print("--- bpm");
+    char buf[16];
 
-    display.setTextSize(1); display.setCursor(0, 18); display.print("SpO2:");
-    display.setTextSize(2); display.setCursor(36, 18);
-    if (g_finger_on && g_spo2 > 0) display.printf("%4.1f%%", g_spo2);
-    else display.print("--.-%");
+    // --- HR ---
+    display.setCursor(COL0_X, 0);
+    display.print("HR");
+    snprintf(buf, sizeof(buf), "%3d", g_finger_on ? beatAvg : 0);
+    display.setCursor(COL0_X, 12);
+    display.print(buf);
 
-    display.drawLine(0, 36, 128, 36, SSD1306_WHITE);
-    display.setTextSize(1); display.setCursor(0, 40);
+    // --- SpO2 ---
+    display.setCursor(COL1_X, 0);
+    display.print("SpO2");
+    snprintf(buf, sizeof(buf), "%2d%%", g_finger_on ? (int)g_spo2 : 0);
+    display.setCursor(COL1_X, 12);
+    display.print(buf);
 
-    if      (g_status.indexOf("BINH")  >= 0) display.print("> NORMAL");
-    else if (g_status.indexOf("CANH")  >= 0) display.print("> WARNING !");
-    else if (g_status.indexOf("NGUY")  >= 0) display.print("> DANGER !!");
-    else if (g_status.indexOf("NGHI")  >= 0) display.print("> ANOMALY ??");
-    else                                      display.print("> DAT NGON TAY");
+    // --- STATUS ---
+    display.setCursor(COL2_X, 0);
+    display.print("Stt");
+    display.setCursor(COL2_X, 12);
+    if      (g_status.indexOf("BINH") >= 0) display.print("NORM");
+    else if (g_status.indexOf("CANH") >= 0) display.print("WARN");
+    else if (g_status.indexOf("NGUY") >= 0) display.print("DANG");
+    else                                    display.print("WAIT");
 
-    display.setCursor(0, 54);
-    display.print(wifiConnected ? WiFi.localIP().toString() : "WiFi...");
+    // --- WEB IP ---
+    display.setCursor(2, 30);
+    display.print("IP: ");
+    display.print(wifiConnected ? WiFi.localIP().toString() : "Offline");
+
+    // --- Waveform ---
+    if (g_finger_on) {
+        float scale = (g_plot_env > 1.0f) ? (3.0f * g_plot_env) : 1000.0f;
+        float norm  = g_plot_sig / scale; 
+        if (norm > 1.0f) norm = 1.0f; 
+        if (norm < -1.0f) norm = -1.0f;
+
+        uint8_t y0 = WAVE_Y0, yh = WAVE_H, mid = y0 + (yh/2);
+        uint8_t y = (uint8_t)( mid - norm*((yh/2)-1) );
+        if (y < y0) y = y0;
+        if (y > (y0+yh-1)) y = y0+yh-1;
+        waveform_buffer[waveform_x] = y;
+    } else {
+        waveform_buffer[waveform_x] = WAVE_Y0 + WAVE_H/2;
+    }
+
+    uint8_t y0 = WAVE_Y0, yh = WAVE_H;
+    for (int x = 0; x < 128; x += 8) { display.drawPixel(x, y0, SSD1306_WHITE); display.drawPixel(x, y0+yh-1, SSD1306_WHITE); }
+    for (int yy = y0; yy <= y0+yh-1; yy += 4) { display.drawPixel(0, yy, SSD1306_WHITE); display.drawPixel(127, yy, SSD1306_WHITE); }
+
+    for (int i=1; i<WAVEFORM_WIDTH; i++) {
+        int x1=i-1, y1=waveform_buffer[(waveform_x+i-1)%WAVEFORM_WIDTH];
+        int x2=i,   y2=waveform_buffer[(waveform_x+i)%WAVEFORM_WIDTH];
+        display.drawLine(x1, y1, x2, y2, SSD1306_WHITE);
+    }
+    
+    waveform_x = (waveform_x + 1) % WAVEFORM_WIDTH;
     display.display();
 }
 
@@ -425,7 +522,6 @@ void setup() {
         server.begin();
     }
 
-    lastSpo2Time = millis();
     Serial.println("[System] San sang! Dat ngon tay len cam bien.\n");
 }
 
@@ -433,56 +529,36 @@ void setup() {
 //  LOOP
 // ═══════════════════════════════════════════════════════════════
 void loop() {
-    // --- Doc IR de phat hien nhip tim realtime (poll FIFO) ---
+    // --- Doc IR+RED tu FIFO theo tung mau (poll) ---
     max30102_read_fifo(&particleSensor);
-    long irValue = (long)particleSensor._ir_samples[0];
+    long irValue  = (long)particleSensor._ir_samples[0];
+    long redValue = (long)particleSensor._red_samples[0];
 
     // Kiem tra ngon tay (IR > 50000 = co ngon tay)
     g_finger_on = (irValue > 50000);
 
     if (g_finger_on) {
-        // SparkFun checkForBeat — phat hien nhip tim
-        if (checkForBeat(irValue)) {
-            long delta = millis() - lastBeat;
-            lastBeat = millis();
+        // Thuat toan EMA BPF — cap nhat theo tung mau, ket qua ngay sau ~2-3s
+        // g_heart_rate va g_spo2 duoc ghi truc tiep trong max30102_cal()
+        max30102_cal((uint32_t)redValue, (uint32_t)irValue);
+        beatAvg = (int)g_heart_rate;
 
-            beatsPerMinute = 60.0f / (delta / 1000.0f);
-
-            // Chi chap nhan 30-220 bpm
-            if (beatsPerMinute > 30 && beatsPerMinute < 220) {
-                rates[rateSpot++ % RATE_SIZE] = (byte)beatsPerMinute;
-
-                // Tinh trung binh
-                beatAvg = 0;
-                for (byte x = 0; x < RATE_SIZE; x++) beatAvg += rates[x];
-                beatAvg /= RATE_SIZE;
-
-                g_heart_rate = (float)beatAvg;
-            }
-        }
-
-        // SpO2: thu thap moi 10 giay
-        if (millis() - lastSpo2Time >= SPO2_INTERVAL_MS) {
-            lastSpo2Time = millis();
-            collectAndComputeSpO2();
-
-            // Chay AI inference sau khi co du lieu
-            if (g_heart_rate > 0 && g_spo2 > 0) {
-                runInference(g_heart_rate, g_spo2);
-            }
+        // Chay AI inference moi 5 giay (sau khi co du lieu on dinh)
+        static unsigned long lastInferenceTime = 0;
+        if (millis() - lastInferenceTime >= 5000 && g_heart_rate > 0 && g_spo2 > 0) {
+            lastInferenceTime = millis();
+            runInference(g_heart_rate, g_spo2);
         }
     } else {
-        // Khong co ngon tay
+        // Khong co ngon tay — reset trang thai
         beatAvg      = 0;
-        g_heart_rate = 0;
-        g_spo2       = 0;
+        g_heart_rate = 0.0f;
+        g_spo2       = 0.0f;
         g_status     = "DAT NGON TAY";
-        rateSpot     = 0;
-        memset(rates, 0, sizeof(rates));
     }
 
-    // OLED cap nhat moi 1 giay
-    if (millis() - lastOledTime >= 1000) {
+    // OLED cap nhat moi 200ms
+    if (millis() - lastOledTime >= 200) {
         lastOledTime = millis();
         updateOLED();
 
